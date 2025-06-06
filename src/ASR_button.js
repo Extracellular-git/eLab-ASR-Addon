@@ -1,0 +1,482 @@
+/*
+@rootVar: EC_ASR_BUTTON
+@name: Experiment Automatic Sample Reduction (ASR) Button
+@version: 1.0.0
+@description: Adds an ASR button into the Experiment toolbar
+@requiredElabVersion: 2.35.0
+@author: Extracellular
+*/
+
+/*!
+ * © 2025 Extracellular — released under the MIT License
+ * See LICENSE file for details.
+ */
+
+var EC_ASR_BUTTON = {};
+
+(function (context) {
+
+  // wrap eLabSDK.API.Call in a promise so that we can await it
+  function api_call(opts) {
+    return new Promise((resolve, reject) => {
+      eLabSDK.API.call(Object.assign({}, opts, {
+        onSuccess: (_xhr, _status, resp) => resolve(resp),
+        onError: (_xhr, _status, error) => reject({error})
+      })); 
+    });
+  }
+
+  // Normalise label: 
+  // turn null/undef into empty string
+  // replace NBSP with normal space
+  // collapse any sequence of whitespace
+  // remove spaces immediately inside brackets
+  // strip leading/trailing whitespace
+  // strip trailing colon and lowercase
+  function normalise_label(s) {
+    let t = (s || "").replace(/\u00a0/g, " ");
+    t = t.replace(/\s+/g, " ");
+    t = t.replace(/\s*\(\s*/g, "(").replace(/\s*\)\s*/g, ")");
+    t = t.trim().replace(/:$/, "").toLowerCase();
+    return t; 
+  }
+
+  // prompt the user for the section header of relevant experiment section
+  function prompt_for_section_header() {
+    return new Promise((resolve) => {
+      if (eLabSDK2.UI.Modal) {
+        const modal = eLabSDK2.UI.Modal.create({
+          title: 'Enter Section Header of Sample Table',
+          content:`
+            <div>
+              <p>Please enter the section header of the experiment section containing the sample table:</p>
+              <input type="text" id="sectionHeaderInput" placeholder="e.g., Materials/Reagents/Chemicals/ etc." style="width: 100%; padding: 8px; box-sizing: border-box;">
+            </div>
+            <div style="margin-top: 10px; text-align: right;">
+              <button id="ASRconfirmButton" class="btn btn-primary">Confirm</button>
+              <button id="ASRcancelButton" class="btn btn-secondary">Cancel</button>
+            </div>
+          `,
+          width: 450,
+        });
+        modal.open();
+
+      
+
+        modal.getElement().querySelector('#ASRconfirmButton').addEventListener('click', () => {
+          const sectionHeader = modal.getElementById('sectionHeaderInput').value; // MIGHT HAVE TO CHANGE THIS TO BE MORE ACCURATE
+          modal.close();
+          // send the section header back to the caller
+          resolve(sectionHeader);
+        });
+
+        modal.getElement().querySelector('#ASRcancelButton').addEventListener('click', () => {
+          modal.close();
+          resolve(null); 
+        });
+      } else {
+        // Fallback to a simple prompt if Modal is not available
+        const raw = window.prompt("Enter the section header of the experiment section containing the sample table:");
+        if (raw === null) {
+          return resolve(null);
+        } else {
+          resolve(raw);
+        }
+      }
+    });
+  }
+
+  // Helper function to clean numeric string, tailored for "amount used"
+  function clean_numeric_string(s) {
+    if (typeof s !== 'string' || s.length === 0) {
+      return "";
+    }
+    // Allows digits and a single decimal point
+    let saw_decimal = false;
+    return Array.from(s).filter(char => {
+      if (char === '.') {
+        if (saw_decimal) return false; // Ignore additional decimal points
+        saw_decimal = true;
+        return true; // Keep the first decimal point
+      }
+      return /[0-9]/.test(char); 
+    }).join("");
+  }
+
+  async function parse_html(html_text) {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html_text, 'text/html');
+    const samples_map = new Map(); // Stores {sampleID: {sampleName, amountUsed} }
+
+    let media_table = null;
+    // try to find specific table by looking for characteristic headers
+    const tables = doc.querySelectorAll('table');
+    for (const table of tables) {
+      const ths = Array.from(table.querySelectorAll('thead th')).map(th => th.textContent.trim());
+      // check for presence of "Item and "Amount used" columns
+      if (ths.includes('Item') && ths.includes('Amount used')) {
+        media_table = table;
+        break; // Found the table, no need to continue
+      }
+    }
+
+    if (!media_table) {
+      console.error("EC_ASR_BUTTON: Could not find the media table in the section HTML.");
+      eLabSDK2.UI.Toast.showToast('Could not find the media table in the section HTML.');
+      return samples_map;
+    }
+
+    const rows = media_table.querySelectorAll('tbody tr');
+
+    rows.forEach(row => {
+      const cells = row.querySelectorAll('td');
+      // "Item" is in the 1st cell (index 0), "Amount used" is in the 6th cell (index 5)
+      if (cells.length >= 6) {
+        const item_cell = cells[0];
+        const amount_used_cell = cells[5];
+
+        let sampleID = null;
+        let sampleName = null;
+        let amountUsedStr = null;
+
+        // extract sample name and id from the 1st cell
+        const anchor = itemCell.querySelector('a[onclick*="Experiment.Section.Sample.view"]');
+        if (anchor) {
+          sampleName = anchor.textContent.trim();
+          const onclickAttr = anchor.getAttribute('onclick');
+          const match = onclickAttr.match(/Experiment\.Section\.Sample\.view\((\d+)\)/);
+          if (match && match[1]) {
+            sampleID = match[1];
+          }
+        }
+        
+        // Extract amont used from the 6th cell
+        // val is typically in nested span
+        const amount_used_span = amount_used_cell.querySelector('span.protVar > span');
+        if (amount_used_span) {
+          amountUsedStr = amount_used_span.textContent.trim();
+        }
+
+        if (amountUsedStr) {
+          amountUsedStr = clean_numeric_string(amountUsedStr);
+        }
+
+        if (sampleID && sampleName && amountUsedStr !== "") {
+          const numericAmount = parseFloat(amountUsedStr);
+          // only add if amount is a valid +ve number
+          if (!isNaN(numericAmount) && numericAmount > 0) {
+            samples_map.set(sampleID, { sampleName, amountUsed: numericAmoun.toString() });
+            console.log(`EC_ASR_BUTTON: Found sample ID ${sampleID} with name "${sampleName}" and amount used ${numericAmount}`);
+          } else {
+            console.warn(`EC_ASR_BUTTON: Item "${sampleName}" (ID: ${sampleID}) has an invalid amount used: "${amountUsedStr}"`);
+          }
+        }
+      }
+    });
+    return samples_map;
+  }
+
+
+  // Automatic Sample Reduction (ASR)!
+  // 1. Ask for section header of the relevant experiment section
+  // 2. Using the provided section header, get the experiment section (API or via expData)
+  // 3. Get the section's html
+  // 4. Parse the table, collecting all the sample IDs and amount to reduce
+  // 5. Get all the sample IDs quantities, and ask the user to confirm reduction by the amount
+  // 6. If confirmed, for each sample call POST /samples/{sampleID}/quantity/subtract
+  // 7. show toasts and handle errors
+
+  async function ASR(expID, expData) {
+    if (!expID) {
+      eLabSDK2.UI.Toast.showToast('Experiment ID is not defined!');
+      console.error("EC_ASR_BUTTON: Experiment ID is not defined.");
+      return;
+    }
+    try {    
+      // 1. Ask for section header of the relevant experiment section
+      const sectionHeader = await prompt_for_section_header();
+      if (!sectionHeader) {
+        eLabSDK2.UI.Toast.showToast('Section header not provided. ASR cancelled.');
+        console.error("EC_ASR_BUTTON: Section header not provided. ASR cancelled.");
+        return;
+      }
+
+      console.log(`EC_ASR_BUTTON: Section header provided: ${sectionHeader}`);
+
+      // 2. Using the provided section header, get the experiment section
+      // if expData.data is present use that to gather the section,
+      // otherwise GET /experiments/{expID}/sections
+      let target_section;
+
+      if (expData && Array.isArray(expData.data)) {
+        target_section = expData.data.find(section => normalise_label(section.sectionHeader) === normalise_label(sectionHeader));
+        console.log(`EC_ASR_BUTTON: Found section in expData.data: ${target_section ? target_section.sectionHeader : 'not found'}`);
+      }
+
+      // If not found in expData, try the API
+      if (!target_section) {
+        console.log("EC_ASR_BUTTON: Section not found in expData, trying API call.");
+        let sections_resp;
+        try {
+          sections_resp = await api_call({
+            method: 'GET',
+            path: 'experiments/{expID}/sections',
+            pathParams: { expID: expID }
+          });
+        } catch (error) {
+          eLabSDK2.UI.Toast.showToast(`Error fetching sections for experiment ${expID}`);
+          console.error(`EC_ASR_BUTTON: Error fetching sections for experiment ${expID}:`, error);
+          return;
+        }
+
+        const all_sections = sections_resp.data || sections_resp;
+        target_section = all_sections.find(section => normalise_label(section.sectionHeader) === normalise_label(sectionHeader)).map((section) => {
+          // only return the sectionHeader and sectionID
+          return {
+            expJournalID: section.expJournalID,
+            sectionHeader: section.sectionHeader
+          };
+        });
+        console.log(`EC_ASR_BUTTON: Found section in API response: ${target_section ? target_section.sectionHeader : 'not found'}`);
+      }
+
+      if (!target_section) {
+        eLabSDK2.UI.Toast.showToast(`Section "${sectionHeader}" not found in experiment ${expID}. ASR cancelled.`);
+        console.error(`EC_ASR_BUTTON: Section "${sectionHeader}" not found in experiment ${expID}. ASR cancelled.`);
+        return;
+      }
+
+      // 3. Get the section's html and parse the table
+      let html_text;
+      try {
+        section_html = await api_call({
+          method: 'GET',
+          path: 'experiments/sections/{expJournalID}/html',
+          pathParams: { expJournalID: target_section.expJournalID }
+        });
+        html_text = html_resp.data || html_resp.html || html_resp;
+      } catch (error) {
+        eLabSDK2.UI.Toast.showToast(`Error fetching section HTML for section ${target_section.expJournalID}`);
+        console.error(`EC_ASR_BUTTON: Error fetching section HTML for section ${target_section.expJournalID}:`, error);
+        return;
+      }
+
+      // 4. Now parse the HTML to get the sample IDs and amount to reduce
+      const extracted_data = await parse_html(html_text);
+
+      if (extracted_data.size === 0) {
+        if (window.eLabSDK2 && eLabSDK2.UI && eLabSDK2.UI.Toast) {
+          eLabSDK2.UI.Toast.showToast('No samples found in the specified section.');
+        }
+        console.warn("EC_ASR_BUTTON: No samples found in the specified section.");
+        return;
+      }
+
+      // 5. build confirmation prompt
+      let confirmation_message_parts = ["Are you sure you want to subtract the following amounts from inventory?"];
+      extracted_data.forEach((data, sampleID) => {
+        confirmation_message_parts.push(`- ${data.amountUsed} of ${data.sampleName} (ID: ${sampleID})`);
+      });
+      const confirmation_message = confirmation_message_parts.join('\n');
+
+      const confirmed = await new Promise((resolve) => {
+        if (window.eLabSDK2 && eLabSDK2.UI && eLabSDK2.UI.Modal) {
+          const modal = eLabSDK2.UI.Modal.create({
+            title: 'Confirm Sample Quantity Reduction',
+            content: `<div style="white-space: pre-wrap; max-height: 300px; overflow-y: auto;">${confirmation_message}</div>
+                      <div style="margin-top:15px; text-align:right;">
+                      <button id="asrConfirmOkBtn" class="btn btn-primary">Confirm</button>
+                      <button id="asrConfirmCancelBtn" class="btn btn-secondary">Cancel</button>
+                      </div>`,
+            width: 500,
+          });
+          modal.open();
+          modal.getElement().querySelector('#asrConfirmOkBtn').addEventListener('click', () => {
+            modal.close();
+            resolve(true);
+          });
+          modal.getElement().querySelector('#asrConfirmCancelBtn').addEventListener('click', () => {
+            modal.close();
+            resolve(false);
+          });
+        } else {
+          // Fallback to a simple confirm dialog if Modal is not available
+          const raw = window.confirm(confirmation_message + "\n\nClick OK to confirm, Cancel to abort.");
+          resolve(raw);
+        }
+      });
+
+      // 6. If confirmed, make API calls to subtract the quantities
+      if (confirmed) {
+        console.log("EC_ASR_BUTTON: User confirmed the sample quantity reduction.");
+        let allSucceeded = true;
+        for (const [sampleID, data] of extracted_data) {
+          try {
+            await api_call({
+              method: 'POST',
+              path: 'samples/{sampleID}/quantity/subtract',
+              pathParams: { sampleID: sampleID },
+              body: { amount: parseFloat(data.amountUsed) }
+            });
+            console.log(`EC_ASR_BUTTON: Successfully subtracted ${data.amountUsed} from sample ID ${sampleID} (${data.sampleName})`);
+            eLabSDK2.UI.Toast.showToast(`Successfully subtracted ${data.amountUsed} from sample ID ${sampleID} (${data.sampleName})`);
+          } catch (error) {
+            allSucceeded = false;
+            console.error(`EC_ASR_BUTTON: Error subtracting quantity for sample ID ${sampleID} (${data.sampleName}):`, error);
+            eLabSDK2.UI.Toast.showToast(`Error subtracting quantity for sample ID ${sampleID} (${data.sampleName}). Check console for details.`);
+          }
+        }
+
+        // 7. Show final toast based on success of all operations
+        if (allSucceeded) {
+          eLabSDK2.UI.Toast.showToast('All sample quantities successfully subtracted.');
+          console.log("EC_ASR_BUTTON: All sample quantities successfully subtracted.");
+        } else {
+          eLabSDK2.UI.Toast.showToast('Some sample quantities could not be subtracted. Check console for details.');
+          console.warn("EC_ASR_BUTTON: Some sample quantities could not be subtracted. Check console for details.");
+        }
+      } else {
+        eLabSDK2.UI.Toast.showToast('Sample quantity reduction cancelled by user.');
+        console.log("EC_ASR_BUTTON: Sample quantity reduction cancelled by user.");
+      }
+
+
+    } catch (error) {
+      console.error("EC_ASR_BUTTON: An error occurred while subtracting sample quantity:", error);
+      eLabSDK2.UI.Toast.showToast('An error occurred while subtracting sample quantity. Check console for details.');
+    }
+  }
+      
+  // ---------------------------------------------------------------
+  // inserting button into the Experiment Action Buttons + into Navbar for redundancy
+  // also just in case
+  // ---------------------------------------------------------------
+  context.init = function () {
+    console.log("EC_ASR_BUTTON:init() called");
+
+    function try_insert_button() {
+        // locate UL that holds all experiment action <li> items
+        const ul = document.querySelector("#experimentactionbuttons ul#options");
+        if (!ul) {
+            console.warn("EC_ASR_BUTTON: Could not find the experiment action buttons UL element.");
+            return false;
+        }
+
+        // if button already inserted
+        if (document.getElementById("ASRInBodyButton")) {
+            console.warn("EC_ASR_BUTTON: Button already exists, not inserting again.");
+            return true;
+        }
+
+        // locate <span id="sdk2actions">
+        const sdk2actions = ul.querySelector("#sdk2actions");
+        if (!sdk2actions) {
+            console.warn("EC_ASR_BUTTON: Could not find the sdk2actions span element.");
+            return false;
+        }
+
+        // build new <li> element
+        const li = document.createElement("li");
+        li.id = "ASRInBodyButton";
+        li.style.display = "inherit"; 
+
+        // inside the <li> create the <a> with icon + text
+        const a = document.createElement("a");
+        a.title = "ASR";
+        a.classList.add("addIcon");
+        a.style.cursor = "pointer";
+
+        // create <i> icon
+        const icon = document.createElement("i");
+        icon.classList.add("fas", "fa-minus-circle");
+        icon.style.marginRight = "4px"; // Add some space between icon and text
+
+        const txt = document.createTextNode("ASR");
+
+        a.appendChild(icon);
+        a.appendChild(txt);
+
+        // attach click handler to <a>
+        a.addEventListener("click", (e) => {
+            e.preventDefault();
+            console.log("EC_ASR_BUTTON: In-Body ASR button clicked");
+            ep = new eLabSDK.Page.Experiment();
+            expID = ep.getExperimentID();
+            expData = ep.getExperimentData();
+            console.log(`Experiment ID: ${expID}`);
+            eLabSDK2.UI.Toast.showToast('ASR clicked!');
+            ASR(expID, expData);
+        });
+
+        li.appendChild(a);
+
+        ul.insertBefore(li, sdk2actions);
+
+        return true;
+    }
+
+    let attempts = 0;
+    const interval = setInterval(() => {
+        if (try_insert_button() || attempts++ > 20) {
+            clearInterval(interval);
+            if (attempts > 20) {
+                console.warn("EC_ASR_BUTTON: Failed to insert button after multiple attempts.");
+            } else {
+                // console.log("EC_ASR_BUTTON: Button inserted successfully.");
+                console.log("EC_ASR_BUTTON: Button inserted successfully.");
+            }
+        }
+    }, 500);
+
+    // Define the minimal button config using 'action' instead of 'onClick'
+    const ASRDataNavButton = {
+      id: 'ASRDataNavButton',
+      label: 'ASR',
+      icon: 'fas fa-minus-circle',
+      action: () => {
+        console.log("EC_ASR_BUTTON: Nav-Bar ASR button clicked");
+        ep = new eLabSDK.Page.Experiment();
+        expID = ep.getExperimentID();
+        expData = ep.getExperimentData();
+        console.log(`Experiment ID: ${expID}`);
+        eLabSDK2.UI.Toast.showToast('ASR clicked!');
+        ASR(expID, expData);
+      }
+    };
+
+    // Documentation is confusing and not sure so basically try everything and see what happens:
+    // Try the Journal-Experiment Navigation first
+    if (
+      eLabSDK2.Journal &&
+      eLabSDK2.Journal.Experiment &&
+      eLabSDK2.Journal.Experiment.UI &&
+      eLabSDK2.Journal.Experiment.UI.Navigation &&
+      typeof eLabSDK2.Journal.Experiment.UI.Navigation.addMainMenuAction === 'function'
+    ) {
+      console.log(
+        "EC_ASR_BUTTON: Registering via eLabSDK2.Journal.Experiment.UI.Navigation.addMainMenuAction"
+      );
+      eLabSDK2.Journal.Experiment.UI.Navigation.addMainMenuAction(ASRDataNavButton);
+      return;
+    }
+
+    // Fallback to the older Section Navigation namespace
+    if (
+      eLabSDK2.Experiment &&
+      eLabSDK2.Experiment.Section &&
+      eLabSDK2.Experiment.Section.UI &&
+      eLabSDK2.Experiment.Section.UI.Navigation &&
+      typeof eLabSDK2.Experiment.Section.UI.Navigation.addMainMenuAction === 'function'
+    ) {
+      console.log(
+        "EC_ASR_BUTTON: Registering via eLabSDK2.Experiment.Section.UI.Navigation.addMainMenuAction"
+      );
+      eLabSDK2.Experiment.Section.UI.Navigation.addMainMenuAction(ASRDataNavButton);
+      return;
+    }
+
+    console.warn(
+      "EC_ASR_BUTTON: Couldn't find a Navigation API to add a main‐menu button."
+    );
+  };
+})(EC_ASR_BUTTON);
