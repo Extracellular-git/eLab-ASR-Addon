@@ -10,19 +10,53 @@
 /*!
  * © 2025 Extracellular — released under the MIT License
  * See LICENSE file for details.
- */
+*/
+
+/*
+  unitShort - quantityType - calculationFactor
+  L - Volume - 1
+  ml - Volume - 0.001
+  µl - Volume - 0.000001
+  kg - Mass - 1000
+  g - Mass - 1
+  mg - Mass - 0.001
+  µg - Mass - 0.000001
+  pcs - Number - 1
+
+*/
 
 var EC_ASR_BUTTON = {};
 
-(function (context) {
 
+(function (context) {
+  
+  const UNIT_DEFINITIONS = {
+    // Volume type (base unit in litres (L))
+    'l': {quantityType: 'Volume', calculationFactor: 1},
+    'ml': {quantityType: 'Volume', calculationFactor: 0.001},
+    'µl': {quantityType: 'Volume', calculationFactor: 0.000001},
+    // Mass type (base unit in grams (g))
+    'kg': {quantityType: 'Mass', calculationFactor: 1000},
+    'g': {quantityType: 'Mass', calculationFactor: 1},
+    'mg': {quantityType: 'Mass', calculationFactor: 0.001},
+    'µg': {quantityType: 'Mass', calculationFactor: 0.000001},
+    // Number type (base unit is pieces (pcs))
+    'pcs': {quantityType: 'Number', calculationFactor: 1}
+  };
   // wrap eLabSDK.API.Call in a promise so that we can await it
   function api_call(opts) {
     return new Promise((resolve, reject) => {
       eLabSDK.API.call(Object.assign({}, opts, {
-        onSuccess: (_xhr, _status, resp) => resolve(resp),
-        onError: (_xhr, _status, error) => reject({error})
-      })); 
+        onSuccess: (xhr, status, resp) => {
+          // Check for HTTP status code 2xx
+          if (xhr && xhr.status && (xhr.status < 200 || xhr.status >= 300)) {
+            reject({ error: `HTTP error ${xhr.status}`, xhr, resp });
+          } else {
+            resolve(resp);
+          }
+        },
+        onError: (xhr, status, error) => reject({ error, xhr, status })
+      }));
     });
   }
 
@@ -106,7 +140,7 @@ var EC_ASR_BUTTON = {};
   async function parse_html(html_text) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(html_text, 'text/html');
-    const samples_map = new Map(); // Stores {sampleID: {sampleName, amountUsed} }
+    const samples_map = new Map(); // Stores {sampleID: {sampleName, amountUsed, unitFromTable} }
 
     let media_table = null;
     // try to find specific table by looking for characteristic headers
@@ -130,17 +164,21 @@ var EC_ASR_BUTTON = {};
 
     rows.forEach(row => {
       const cells = row.querySelectorAll('td');
-      // "Item" is in the 1st cell (index 0), "Amount used" is in the 6th cell (index 5)
-      if (cells.length >= 6) {
+      // "Item" is in the 1st cell (index 0), 
+      // "Amount used" is in the 6th cell (index 5)
+      // "Unit" for "Amount used" is in the 7th cell (index 6)
+      if (cells.length >= 7) {
         const item_cell = cells[0];
         const amount_used_cell = cells[5];
+        const unit_cell = cells[6];
 
         let sampleID = null;
         let sampleName = null;
         let amountUsedStr = null;
+        let unitFromTable = null;
 
         // extract sample name and id from the 1st cell
-        const anchor = itemCell.querySelector('a[onclick*="Experiment.Section.Sample.view"]');
+        const anchor = item_cell.querySelector('a[onclick*="Experiment.Section.Sample.view"]');
         if (anchor) {
           sampleName = anchor.textContent.trim();
           const onclickAttr = anchor.getAttribute('onclick');
@@ -152,23 +190,28 @@ var EC_ASR_BUTTON = {};
         
         // Extract amont used from the 6th cell
         // val is typically in nested span
-        const amount_used_span = amount_used_cell.querySelector('span.protVar > span');
+        const amount_used_span = amount_used_cell.querySelector('span.protVar');
         if (amount_used_span) {
           amountUsedStr = amount_used_span.textContent.trim();
+        }
+
+        const unit_span = unit_cell.querySelector('span.protVar');
+        if (unit_span) {
+          unitFromTable = unit_span.textContent.trim().toLowerCase(); // normalise to lowercase
         }
 
         if (amountUsedStr) {
           amountUsedStr = clean_numeric_string(amountUsedStr);
         }
 
-        if (sampleID && sampleName && amountUsedStr !== "") {
+        if (sampleID && sampleName && amountUsedStr !== "" && unitFromTable && unitFromTable !== "") {
           const numericAmount = parseFloat(amountUsedStr);
           // only add if amount is a valid +ve number
           if (!isNaN(numericAmount) && numericAmount > 0) {
-            samples_map.set(sampleID, { sampleName, amountUsed: numericAmoun.toString() });
-            console.log(`EC_ASR_BUTTON: Found sample ID ${sampleID} with name "${sampleName}" and amount used ${numericAmount}`);
+            samples_map.set(sampleID, { sampleName, amountUsed: numericAmount, unitFromTable });
+            console.log(`EC_ASR_BUTTON: Found sample ID ${sampleID} ("${sampleName}"): ${numericAmount} ${unitFromTable}`);
           } else {
-            console.warn(`EC_ASR_BUTTON: Item "${sampleName}" (ID: ${sampleID}) has an invalid amount used: "${amountUsedStr}"`);
+            console.warn(`EC_ASR_BUTTON: Item "${sampleName}" (ID: ${sampleID}) has an invalid amount used: "${amountUsedStr}" or missing unit: "${unitFromTable}".`);
           }
         }
       }
@@ -207,6 +250,7 @@ var EC_ASR_BUTTON = {};
       // if expData.data is present use that to gather the section,
       // otherwise GET /experiments/{expID}/sections
       let target_section;
+      let html_text = null;
 
       if (expData && Array.isArray(expData.data)) {
         target_section = expData.data.find(section => normalise_label(section.sectionHeader) === normalise_label(sectionHeader));
@@ -230,13 +274,13 @@ var EC_ASR_BUTTON = {};
         }
 
         const all_sections = sections_resp.data || sections_resp;
-        target_section = all_sections.find(section => normalise_label(section.sectionHeader) === normalise_label(sectionHeader)).map((section) => {
-          // only return the sectionHeader and sectionID
-          return {
-            expJournalID: section.expJournalID,
-            sectionHeader: section.sectionHeader
+        const found_section_from_api = all_sections.find(section => normalise_label(section.sectionHeader) === normalise_label(sectionHeader));
+        if (found_section_from_api) {
+          target_section = {
+            expJournalID: found_section_from_api.expJournalID,
+            sectionHeader: found_section_from_api.sectionHeader
           };
-        });
+        }
         console.log(`EC_ASR_BUTTON: Found section in API response: ${target_section ? target_section.sectionHeader : 'not found'}`);
       }
 
@@ -247,35 +291,94 @@ var EC_ASR_BUTTON = {};
       }
 
       // 3. Get the section's html and parse the table
-      let html_text;
-      try {
-        section_html = await api_call({
-          method: 'GET',
-          path: 'experiments/sections/{expJournalID}/html',
-          pathParams: { expJournalID: target_section.expJournalID }
-        });
-        html_text = html_resp.data || html_resp.html || html_resp;
-      } catch (error) {
-        eLabSDK2.UI.Toast.showToast(`Error fetching section HTML for section ${target_section.expJournalID}`);
-        console.error(`EC_ASR_BUTTON: Error fetching section HTML for section ${target_section.expJournalID}:`, error);
-        return;
+      if (typeof target_section.contents === 'string' && target_section.contents.trim() !== '') {
+        html_text = target_section.contents;
+        console.log("EC_ASR_BUTTON: Using section contents from expData.");
+      }
+
+      if (!html_text) {
+        try {
+          html_resp = await api_call({
+            method: 'GET',
+            path: 'experiments/sections/{expJournalID}/html',
+            pathParams: { expJournalID: target_section.expJournalID }
+          });
+          html_text = html_resp.data || html_resp.html || html_resp;
+        } catch (error) {
+          eLabSDK2.UI.Toast.showToast(`Error fetching section HTML for section ${target_section.expJournalID}`);
+          console.error(`EC_ASR_BUTTON: Error fetching section HTML for section ${target_section.expJournalID}:`, error);
+          return;
+        }
+        console.log("EC_ASR_BUTTON: Fetched section HTML from API.");
       }
 
       // 4. Now parse the HTML to get the sample IDs and amount to reduce
       const extracted_data = await parse_html(html_text);
 
       if (extracted_data.size === 0) {
-        if (window.eLabSDK2 && eLabSDK2.UI && eLabSDK2.UI.Toast) {
-          eLabSDK2.UI.Toast.showToast('No samples found in the specified section.');
-        }
+        eLabSDK2.UI.Toast.showToast('No samples found in the specified section.');
         console.warn("EC_ASR_BUTTON: No samples found in the specified section.");
+        return;
+      }
+
+      // Have to scale the amounts based on the unit
+      const samples_for_reduction = [];
+      let preparation_errors = false;
+
+      for (const [sampleID, table_data] of extracted_data) {
+        try {
+          const sample_quantity_settings_resp = await api_call({
+            method: 'GET',
+            path: 'samples/{sampleID}/quantity',
+            pathParams: { sampleID: sampleID }
+          });
+          const sample_settings = sample_quantity_settings_resp.data || sample_quantity_settings_resp;
+          const table_unit_def = UNIT_DEFINITIONS[table_data.unitFromTable];
+
+          if (!table_unit_def) {
+            console.warn(`EC_ASR_BUTTON: Unknown unit "${table_data.unitFromTable}" for sample ID ${sampleID} (${table_data.sampleName}). Skipping.`);
+            eLabSDK2.UI.Toast.showToast(`Unknown unit "${table_data.unitFromTable}" for sample ID ${sampleID} (${table_data.sampleName}). Skipping.`);
+            preparation_errors = true;
+            continue; // Skip this sample
+          }
+
+          if (table_unit_def.quantityType !== sample_settings.quantityType) {
+            console.warn(`EC_ASR_BUTTON: Quantity type mismatch for sample ID ${sampleID} (${table_data.sampleName}). Expected ${sample_settings.quantityType}, got ${table_unit_def.quantityType}. Skipping.`);
+            eLabSDK2.UI.Toast.showToast(`Quantity type mismatch for sample ID ${sampleID} (${table_data.sampleName}). Expected ${sample_settings.quantityType}, got ${table_unit_def.quantityType}. Skipping.`);
+            preparation_errors = true;
+            continue; // Skip this sample
+          }
+
+          // i.e if in ml we do amount from table * 0.001
+          const amount_to_subtract_in_base_unit = table_data.amountUsed * table_unit_def.calculationFactor;
+
+          samples_for_reduction.push({
+            sampleID: sampleID,
+            sampleName: table_data.sampleName,
+            amountFromTable: table_data.amountUsed, // Original amount from table
+            unitFromTable: table_data.unitFromTable,   // Original unit from table
+            amountToSubtract: amount_to_subtract_in_base_unit, // Amount converted to sample's base unit
+            sampleBaseUnitName: sample_settings.unit // e.g. "Gram", "Liter" for logging/debug
+          });
+
+        } catch (error) {
+          console.error(`EC_ASR_BUTTON: Error fetching sample settings for sample ID ${sampleID} (${table_data.sampleName}):`, error);
+          eLabSDK2.UI.Toast.showToast(`Error fetching sample settings for sample ID ${sampleID} (${table_data.sampleName}). Check console for details.`);
+          preparation_errors = true;
+        }
+      }
+
+      if (samples_for_reduction.length === 0) {
+        const msg = preparation_errors ? 'No samples eligible for reduction after checks and errors' : 'No samples found matching criteria for reduction';
+        eLabSDK2.UI.Toast.showToast(msg);
+        console.warn(`EC_ASR_BUTTON: ${msg}`);
         return;
       }
 
       // 5. build confirmation prompt
       let confirmation_message_parts = ["Are you sure you want to subtract the following amounts from inventory?"];
-      extracted_data.forEach((data, sampleID) => {
-        confirmation_message_parts.push(`- ${data.amountUsed} of ${data.sampleName} (ID: ${sampleID})`);
+      samples_for_reduction.forEach(sample => {
+        confirmation_message_parts.push(`- ${sample.amountFromTable} ${sample.unitFromTable} of ${sample.sampleName} (ID: ${sample.sampleID})`);
       });
       const confirmation_message = confirmation_message_parts.join('\n');
 
@@ -310,20 +413,22 @@ var EC_ASR_BUTTON = {};
       if (confirmed) {
         console.log("EC_ASR_BUTTON: User confirmed the sample quantity reduction.");
         let allSucceeded = true;
-        for (const [sampleID, data] of extracted_data) {
+        for (const sample of samples_for_reduction) {
           try {
             await api_call({
               method: 'POST',
               path: 'samples/{sampleID}/quantity/subtract',
-              pathParams: { sampleID: sampleID },
-              body: { amount: parseFloat(data.amountUsed) }
+              pathParams: { sampleID: sample.sampleID },
+              body: parseFloat(sample.amountToSubtract)
             });
-            console.log(`EC_ASR_BUTTON: Successfully subtracted ${data.amountUsed} from sample ID ${sampleID} (${data.sampleName})`);
-            eLabSDK2.UI.Toast.showToast(`Successfully subtracted ${data.amountUsed} from sample ID ${sampleID} (${data.sampleName})`);
+            const successMsg = `Successfully subtracted ${sample.amountFromTable} ${sample.unitFromTable} from ${sample.sampleName} (ID: ${sample.sampleID}).`;
+            console.log(`EC_ASR_BUTTON: ${successMsg} (Converted to ${sample.amountToSubtract} ${sample.sampleBaseUnitName})`);
+            eLabSDK2.UI.Toast.showToast(successMsg);
           } catch (error) {
             allSucceeded = false;
-            console.error(`EC_ASR_BUTTON: Error subtracting quantity for sample ID ${sampleID} (${data.sampleName}):`, error);
-            eLabSDK2.UI.Toast.showToast(`Error subtracting quantity for sample ID ${sampleID} (${data.sampleName}). Check console for details.`);
+            const errorMsg = `Error subtracting ${sample.amountFromTable} ${sample.unitFromTable} for ${sample.sampleName} (ID: ${sample.sampleID}).`;
+            console.error(`EC_ASR_BUTTON: ${errorMsg}`, error);
+            eLabSDK2.UI.Toast.showToast(`${errorMsg} Check console.`);
           }
         }
 
@@ -333,7 +438,7 @@ var EC_ASR_BUTTON = {};
           console.log("EC_ASR_BUTTON: All sample quantities successfully subtracted.");
         } else {
           eLabSDK2.UI.Toast.showToast('Some sample quantities could not be subtracted. Check console for details.');
-          console.warn("EC_ASR_BUTTON: Some sample quantities could not be subtracted. Check console for details.");
+          console.warn("EC_ASR_BUTTON: Some sample quantities could not be subtracted.");
         }
       } else {
         eLabSDK2.UI.Toast.showToast('Sample quantity reduction cancelled by user.');
