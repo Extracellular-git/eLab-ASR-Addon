@@ -35,11 +35,13 @@ var EC_ASR_BUTTON = {};
     'l': {quantityType: 'Volume', calculationFactor: 1},
     'ml': {quantityType: 'Volume', calculationFactor: 0.001},
     'µl': {quantityType: 'Volume', calculationFactor: 0.000001},
+    'ul': {quantityType: 'Volume', calculationFactor: 0.000001},
     // Mass type (base unit in grams (g))
     'kg': {quantityType: 'Mass', calculationFactor: 1000},
     'g': {quantityType: 'Mass', calculationFactor: 1},
     'mg': {quantityType: 'Mass', calculationFactor: 0.001},
     'µg': {quantityType: 'Mass', calculationFactor: 0.000001},
+    'ug': {quantityType: 'Mass', calculationFactor: 0.000001},
     // Number type (base unit is pieces (pcs))
     'pcs': {quantityType: 'Number', calculationFactor: 1}
   };
@@ -137,6 +139,10 @@ var EC_ASR_BUTTON = {};
     }).join("");
   }
 
+  // Parsing for 2 types of HTML structures (so can be quite confusing):
+  // Format 1: <td><span class="protVar"><span class="protVarSampleField"><span class="sampleFieldContent"><a onclick="Experiment.Section.Sample.view(12345)">Sample Name</a></span></span></span></td>
+  // Format 2: <td><a onclick="Experiment.Section.Sample.view(12345)"><span class="protVar protVarSampleField sampleFieldContent">Sample Name</span></a></td>
+  // Both formats can have nested spans for values, but Format 1 has deeper nesting and Format 2 has flatter structure.
   async function parse_html(html_text) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(html_text, 'text/html');
@@ -146,9 +152,24 @@ var EC_ASR_BUTTON = {};
     // try to find specific table by looking for characteristic headers
     const tables = doc.querySelectorAll('table');
     for (const table of tables) {
-      const ths = Array.from(table.querySelectorAll('thead th')).map(th => th.textContent.trim());
-      // check for presence of "Item and "Amount used" columns
-      if (ths.includes('Item') && ths.includes('Amount used')) {
+      // Check both thead th and tbody td (first row) for headers
+      let headers = [];
+      
+      // First try thead th
+      const ths = table.querySelectorAll('thead th');
+      if (ths.length > 0) {
+        headers = Array.from(ths).map(th => th.textContent.trim());
+      } else {
+        // If no thead, check first tbody tr for headers
+        const firstRow = table.querySelector('tbody tr:first-child');
+        if (firstRow) {
+          const tds = firstRow.querySelectorAll('td');
+          headers = Array.from(tds).map(td => td.textContent.trim());
+        }
+      }
+      
+      // check for presence of "Item" and "Amount used" columns
+      if (headers.includes('Item') && headers.includes('Amount used')) {
         media_table = table;
         break; // Found the table, no need to continue
       }
@@ -161,8 +182,86 @@ var EC_ASR_BUTTON = {};
     }
 
     const rows = media_table.querySelectorAll('tbody tr');
+    
+    // Skip the first row if it contains headers (no thead present)
+    const hasThHeader = media_table.querySelector('thead th');
+    const startIndex = hasThHeader ? 0 : 1; // Skip first row if it's headers
 
-    rows.forEach(row => {
+    // Helper function to extract sample data from a cell using different strategies
+    function extractSampleData(cell) {
+      let sampleID = null;
+      let sampleName = null;
+      
+      // Strategy 1: Format 2 - anchor wraps span
+      let anchor = cell.querySelector('a[onclick*="Experiment.Section.Sample.view"]');
+      if (anchor) {
+        const span = anchor.querySelector('span');
+        if (span) {
+          sampleName = span.textContent.trim();
+        } else {
+          sampleName = anchor.textContent.trim();
+        }
+        
+        const onclickAttr = anchor.getAttribute('onclick');
+        const match = onclickAttr.match(/Experiment\.Section\.Sample\.view\((\d+)\)/);
+        if (match && match[1]) {
+          sampleID = match[1];
+        }
+      }
+      
+      // Strategy 2: Format 1 - nested spans with anchor inside
+      if (!sampleID || !sampleName) {
+        anchor = cell.querySelector('span a[onclick*="Experiment.Section.Sample.view"]');
+        if (anchor) {
+          sampleName = anchor.textContent.trim();
+          
+          const onclickAttr = anchor.getAttribute('onclick');
+          const match = onclickAttr.match(/Experiment\.Section\.Sample\.view\((\d+)\)/);
+          if (match && match[1]) {
+            sampleID = match[1];
+          }
+        }
+      }
+      
+      return { sampleID, sampleName };
+    }
+
+    // Helper function to extract value from a cell using different strategies
+    function extractCellValue(cell) {
+      let value = null;
+      
+      // Strategy 1: Nested span structure (Format 1)
+      let span = cell.querySelector('span.protVar > span');
+      if (span) {
+        value = span.textContent.trim();
+      }
+      
+      // Strategy 2: Direct span structure (Format 2)
+      if (!value || value === '') {
+        span = cell.querySelector('span.protVar');
+        if (span) {
+          value = span.textContent.trim();
+        }
+      }
+      
+      // Strategy 3: Any span as fallback
+      if (!value || value === '') {
+        span = cell.querySelector('span');
+        if (span) {
+          value = span.textContent.trim();
+        }
+      }
+      
+      // Strategy 4: Direct cell text content as last resort
+      if (!value || value === '') {
+        value = cell.textContent.trim();
+      }
+      
+      return value;
+    }
+
+    for (let i = startIndex; i < rows.length; i++) {
+      const row = rows[i];
       const cells = row.querySelectorAll('td');
       // "Item" is in the 1st cell (index 0), 
       // "Amount used" is in the 6th cell (index 5)
@@ -172,32 +271,15 @@ var EC_ASR_BUTTON = {};
         const amount_used_cell = cells[5];
         const unit_cell = cells[6];
 
-        let sampleID = null;
-        let sampleName = null;
-        let amountUsedStr = null;
-        let unitFromTable = null;
-
-        // extract sample name and id from the 1st cell
-        const anchor = item_cell.querySelector('a[onclick*="Experiment.Section.Sample.view"]');
-        if (anchor) {
-          sampleName = anchor.textContent.trim();
-          const onclickAttr = anchor.getAttribute('onclick');
-          const match = onclickAttr.match(/Experiment\.Section\.Sample\.view\((\d+)\)/);
-          if (match && match[1]) {
-            sampleID = match[1];
-          }
-        }
+        // Extract sample data using multiple strategies
+        const { sampleID, sampleName } = extractSampleData(item_cell);
         
-        // Extract amont used from the 6th cell
-        // val is typically in nested span
-        const amount_used_span = amount_used_cell.querySelector('span.protVar');
-        if (amount_used_span) {
-          amountUsedStr = amount_used_span.textContent.trim();
-        }
+        // Extract amount used and unit
+        let amountUsedStr = extractCellValue(amount_used_cell);
+        let unitFromTable = extractCellValue(unit_cell);
 
-        const unit_span = unit_cell.querySelector('span.protVar');
-        if (unit_span) {
-          unitFromTable = unit_span.textContent.trim().toLowerCase(); // normalise to lowercase
+        if (unitFromTable) {
+          unitFromTable = unitFromTable.toLowerCase(); // normalise to lowercase
         }
 
         if (amountUsedStr) {
@@ -213,9 +295,13 @@ var EC_ASR_BUTTON = {};
           } else {
             console.warn(`EC_ASR_BUTTON: Item "${sampleName}" (ID: ${sampleID}) has an invalid amount used: "${amountUsedStr}" or missing unit: "${unitFromTable}".`);
           }
+        } else {
+          console.warn(`EC_ASR_BUTTON: Could not extract complete data from row ${i}:`, {
+            sampleID, sampleName, amountUsedStr, unitFromTable
+          });
         }
       }
-    });
+    }
     return samples_map;
   }
 
@@ -333,7 +419,7 @@ var EC_ASR_BUTTON = {};
             pathParams: { sampleID: sampleID }
           });
           const sample_settings = sample_quantity_settings_resp.data || sample_quantity_settings_resp;
-          const table_unit_def = UNIT_DEFINITIONS[table_data.unitFromTable];
+          const table_unit_def = UNIT_DEFINITIONS[table_data.unitFromTable.toLowerCase().trim()]; // Normalise unit to lowercase and trim whitespace
 
           if (!table_unit_def) {
             console.warn(`EC_ASR_BUTTON: Unknown unit "${table_data.unitFromTable}" for sample ID ${sampleID} (${table_data.sampleName}). Skipping.`);
