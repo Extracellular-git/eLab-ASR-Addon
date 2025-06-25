@@ -407,9 +407,10 @@ var EC_ASR_BUTTON = {};
         return;
       }
 
-      // Have to scale the amounts based on the unit
+      // Validate ALL samples before proceeding
+      // This means that all sample subtractions must be valid BEFORE we ask for confirmation
       const samples_for_reduction = [];
-      let preparation_errors = false;
+      const validation_errors = [];
 
       for (const [sampleID, table_data] of extracted_data) {
         try {
@@ -422,21 +423,23 @@ var EC_ASR_BUTTON = {};
           const table_unit_def = UNIT_DEFINITIONS[table_data.unitFromTable.toLowerCase().trim()]; // Normalise unit to lowercase and trim whitespace
 
           if (!table_unit_def) {
-            console.warn(`EC_ASR_BUTTON: Unknown unit "${table_data.unitFromTable}" for sample ID ${sampleID} (${table_data.sampleName}). Skipping.`);
-            eLabSDK2.UI.Toast.showToast(`Unknown unit "${table_data.unitFromTable}" for sample ID ${sampleID} (${table_data.sampleName}). Skipping.`);
-            preparation_errors = true;
-            continue; // Skip this sample
+            validation_errors.push(`Unknown unit "${table_data.unitFromTable}" for sample ${table_data.sampleName} (ID: ${sampleID})`);
+            continue;
           }
 
           if (table_unit_def.quantityType !== sample_settings.quantityType) {
-            console.warn(`EC_ASR_BUTTON: Quantity type mismatch for sample ID ${sampleID} (${table_data.sampleName}). Expected ${sample_settings.quantityType}, got ${table_unit_def.quantityType}. Skipping.`);
-            eLabSDK2.UI.Toast.showToast(`Quantity type mismatch for sample ID ${sampleID} (${table_data.sampleName}). Expected ${sample_settings.quantityType}, got ${table_unit_def.quantityType}. Skipping.`);
-            preparation_errors = true;
-            continue; // Skip this sample
+            validation_errors.push(`Quantity type mismatch for sample ${table_data.sampleName} (ID: ${sampleID}). Expected ${sample_settings.quantityType}, got ${table_unit_def.quantityType}`);
+            continue;
           }
 
           // i.e if in ml we do amount from table * 0.001
           const amount_to_subtract_in_base_unit = table_data.amountUsed * table_unit_def.calculationFactor;
+
+          // Check if we have enough quantity to subtract
+          if (sample_settings.amount < amount_to_subtract_in_base_unit) {
+            validation_errors.push(`Insufficient quantity for sample ${table_data.sampleName} (ID: ${sampleID}). Available: ${sample_settings.amount} ${sample_settings.unit}, Requested: ${amount_to_subtract_in_base_unit} ${sample_settings.unit}`);
+            continue;
+          }
 
           samples_for_reduction.push({
             sampleID: sampleID,
@@ -449,15 +452,39 @@ var EC_ASR_BUTTON = {};
 
         } catch (error) {
           console.error(`EC_ASR_BUTTON: Error fetching sample settings for sample ID ${sampleID} (${table_data.sampleName}):`, error);
-          eLabSDK2.UI.Toast.showToast(`Error fetching sample settings for sample ID ${sampleID} (${table_data.sampleName}). Check console for details.`);
-          preparation_errors = true;
+          validation_errors.push(`Error fetching sample settings for sample ${table_data.sampleName} (ID: ${sampleID}): ${error.error || error.message || 'Unknown error'}`);
         }
       }
 
+      // If there are any validation errors, show them and abort
+      if (validation_errors.length > 0) {
+        const errorMessage = 'Validation failed for the following samples:\n\n' + validation_errors.join('\n') + '\n\nPlease fix these issues before proceeding with ASR.' + '\n\nIf you believe this is not right, please refresh the page OR contact addon support';
+        
+        if (window.eLabSDK2 && eLabSDK2.UI && eLabSDK2.UI.Modal) {
+          const modal = eLabSDK2.UI.Modal.create({
+            title: 'ASR Validation Errors',
+            content: `<div style="white-space: pre-wrap; max-height: 400px; overflow-y: auto; color: #d32f2f;">${errorMessage}</div>
+                      <div style="margin-top:15px; text-align:right;">
+                      <button id="asrErrorOkBtn" class="btn btn-primary">OK</button>
+                      </div>`,
+            width: 600,
+          });
+          modal.open();
+          modal.getElement().querySelector('#asrErrorOkBtn').addEventListener('click', () => {
+            modal.close();
+          });
+        } else {
+          alert(errorMessage);
+        }
+        
+        console.error("EC_ASR_BUTTON: Validation errors found:", validation_errors);
+        eLabSDK2.UI.Toast.showToast('ASR validation failed. Check the error dialog for details.');
+        return;
+      }
+
       if (samples_for_reduction.length === 0) {
-        const msg = preparation_errors ? 'No samples eligible for reduction after checks and errors' : 'No samples found matching criteria for reduction';
-        eLabSDK2.UI.Toast.showToast(msg);
-        console.warn(`EC_ASR_BUTTON: ${msg}`);
+        eLabSDK2.UI.Toast.showToast('No samples eligible for reduction after validation');
+        console.warn("EC_ASR_BUTTON: No samples eligible for reduction after validation");
         return;
       }
 
@@ -523,8 +550,8 @@ var EC_ASR_BUTTON = {};
           eLabSDK2.UI.Toast.showToast('All sample quantities successfully subtracted.');
           console.log("EC_ASR_BUTTON: All sample quantities successfully subtracted.");
         } else {
-          eLabSDK2.UI.Toast.showToast('Some sample quantities could not be subtracted. Check console for details.');
-          console.warn("EC_ASR_BUTTON: Some sample quantities could not be subtracted.");
+          eLabSDK2.UI.Toast.showToast('Some sample quantities could not be subtracted despite validation. This is unexpected - check console for details.');
+          console.error("EC_ASR_BUTTON: Some sample quantities could not be subtracted despite validation.");
         }
       } else {
         eLabSDK2.UI.Toast.showToast('Sample quantity reduction cancelled by user.');
