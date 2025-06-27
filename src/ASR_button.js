@@ -139,55 +139,197 @@ var EC_ASR_BUTTON = {};
     }).join("");
   }
 
-  // Parsing for 2 types of HTML structures (so can be quite confusing):
-  // Format 1: <td><span class="protVar"><span class="protVarSampleField"><span class="sampleFieldContent"><a onclick="Experiment.Section.Sample.view(12345)">Sample Name</a></span></span></span></td>
-  // Format 2: <td><a onclick="Experiment.Section.Sample.view(12345)"><span class="protVar protVarSampleField sampleFieldContent">Sample Name</span></a></td>
-  // Both formats can have nested spans for values, but Format 1 has deeper nesting and Format 2 has flatter structure.
+  // Parsing for multiple table structures in a single section:
+  // Format 1 (7-col): "Used sample/Item", "Qty needed/L", "Unit", "Qty needed", "Unit", "Used Amount/Amount used", "Unit"
+  // Format 2 (3-col): "Used sample/Used Sample", "Used Amount", "Unit"  
   async function parse_html(html_text) {
     const parser = new DOMParser();
     const doc = parser.parseFromString(html_text, 'text/html');
     const samples_map = new Map(); // Stores {sampleID: {sampleName, amountUsed, unitFromTable} }
 
-    let media_table = null;
-    // try to find specific table by looking for characteristic headers
+    // Find ALL tables in the section
     const tables = doc.querySelectorAll('table');
-    for (const table of tables) {
-      // Check both thead th and tbody td (first row) for headers
+    console.log(`EC_ASR_BUTTON: Found ${tables.length} table(s) in section`);
+
+    let tablesProcessed = 0;
+
+    // For each table in the section
+    for (let tableIndex = 0; tableIndex < tables.length; tableIndex++) {
+      const table = tables[tableIndex];
+      console.log(`EC_ASR_BUTTON: Processing table ${tableIndex + 1}`);
+
+      // Get headers from either thead or first tbody row
       let headers = [];
-      
-      // First try thead th
       const ths = table.querySelectorAll('thead th');
       if (ths.length > 0) {
-        headers = Array.from(ths).map(th => th.textContent.trim());
+        headers = Array.from(ths).map(th => th.textContent.trim().toLowerCase());
       } else {
-        // If no thead, check first tbody tr for headers
         const firstRow = table.querySelector('tbody tr:first-child');
         if (firstRow) {
           const tds = firstRow.querySelectorAll('td');
-          headers = Array.from(tds).map(td => td.textContent.trim());
+          headers = Array.from(tds).map(td => td.textContent.trim().toLowerCase());
         }
       }
+
+      if (headers.length === 0) {
+        console.warn(`EC_ASR_BUTTON: No headers found in table ${tableIndex + 1}`);
+        continue;
+      }
+
+      console.log(`EC_ASR_BUTTON: Table ${tableIndex + 1} headers:`, headers);
+
+      // Determine table format based on headers
+      let sampleColIndex = -1;
+      let amountColIndex = -1;
+      let unitColIndex = -1;
+
+      // Check for columns, we support the following:
+      // 1. Format 1 (7-col): "Used sample/Item", "Qty needed/L", "Unit", "Qty needed", "Unit", "Used Amount/Amount used", "Unit"
+      // 2. Format 2 (3-col): "Used sample/Used Sample", "Used Amount", "Unit"
+      // We also remove any trailing colons
+
+      // Check for sample column (flexible header names)
+      const sampleHeaders = ['item', 'used sample', 'item:', 'used sample:'];
+      sampleColIndex = headers.findIndex(h => sampleHeaders.some(sh => h.includes(sh.replace(':', ''))));
+
+      // Check for amount column (flexible header names) 
+      const amountHeaders = ['amount used', 'used amount', 'amount used:', 'used amount:'];
+      amountColIndex = headers.findIndex(h => amountHeaders.some(ah => h.includes(ah.replace(':', ''))));
+
+      // Check for unit column
+      const unitHeaders = ['unit', 'unit:'];
+      unitColIndex = headers.findIndex(h => unitHeaders.some(uh => h.includes(uh.replace(':', ''))));
+
+      if (sampleColIndex === -1 || amountColIndex === -1) {
+        console.log(`EC_ASR_BUTTON: Table ${tableIndex + 1} doesn't contain sample usage data (sample col: ${sampleColIndex}, amount col: ${amountColIndex}), skipping`);
+        continue;
+      }
+
+      // For 7-column tables 
+      if (headers.length >= 7) {
+        // Look for "Used Amount" specifically
+        const usedAmountIndex = headers.findIndex(h => h.includes('used amount'));
+        if (usedAmountIndex > amountColIndex) {
+          amountColIndex = usedAmountIndex;
+          // Use the unit column immediately after the used amount column
+          unitColIndex = amountColIndex + 1;
+        } else {
+          // If we couldn't find a specific "used amount" column but we have 7+ columns,
+          // assume the pattern is: sample, needed/L, unit, needed, unit, used, unit
+          // So the used amount is at index 5 and its unit is at index 6
+          if (headers.length >= 7) {
+            amountColIndex = 5;
+            unitColIndex = 6;
+          }
+        }
+      }
+
+      console.log(`EC_ASR_BUTTON: Table ${tableIndex + 1} - Sample col: ${sampleColIndex}, Amount col: ${amountColIndex}, Unit col: ${unitColIndex}`);
+
+      // Process table rows
+      const rows = table.querySelectorAll('tbody tr');
+      const hasThHeader = table.querySelector('thead th');
+      const startIndex = hasThHeader ? 0 : 1; // Skip first row if it's headers
+
+      let rowsProcessed = 0;
+      for (let i = startIndex; i < rows.length; i++) {
+        const row = rows[i];
+        const cells = row.querySelectorAll('td');
+        
+        if (cells.length <= Math.max(sampleColIndex, amountColIndex)) {
+          console.warn(`EC_ASR_BUTTON: Table ${tableIndex + 1}, Row ${i + 1}: Not enough columns (${cells.length})`);
+          continue; // Not enough columns
+        }
+
+        const sampleCell = cells[sampleColIndex];
+        const amountCell = cells[amountColIndex];
+        const unitCell = unitColIndex !== -1 && unitColIndex < cells.length ? cells[unitColIndex] : null;
+
+        // Extract sample data
+        const { sampleID, sampleName } = extractSampleData(sampleCell);
+        
+        if (!sampleID || !sampleName) {
+          console.log(`EC_ASR_BUTTON: Table ${tableIndex + 1}, Row ${i + 1}: No valid sample data`);
+          continue; // Skip rows without valid sample data
+        }
+
+        // Extract amount and unit
+        let amountUsedStr = extractCellValue(amountCell);
+        let unitFromTable = unitCell ? extractCellValue(unitCell) : null;
+
+        if (!amountUsedStr || !unitFromTable) {
+          console.warn(`EC_ASR_BUTTON: Table ${tableIndex + 1}, Row ${i + 1}: Missing amount (${amountUsedStr}) or unit (${unitFromTable}) for ${sampleName}`);
+          continue;
+        }
+
+        // Clean and validate data - we normalise the unit string to map later
+        unitFromTable = unitFromTable.toLowerCase().trim();
+        amountUsedStr = clean_numeric_string(amountUsedStr);
+        const numericAmount = parseFloat(amountUsedStr);
+
+        if (isNaN(numericAmount) || numericAmount <= 0) {
+          console.warn(`EC_ASR_BUTTON: Table ${tableIndex + 1}, Row ${i + 1}: Invalid amount "${amountUsedStr}" for ${sampleName}`);
+          continue;
+        }
+
+        // Add to or update samples_map (accumulate if sample appears multiple times)
+        if (samples_map.has(sampleID)) {
+          const existing = samples_map.get(sampleID);
+          
+          // Check if units are compatible (same quantity type)
+          const existingUnitDef = UNIT_DEFINITIONS[existing.unitFromTable];
+          const currentUnitDef = UNIT_DEFINITIONS[unitFromTable];
+          
+          if (!existingUnitDef || !currentUnitDef) {
+            console.warn(`EC_ASR_BUTTON: Unknown unit definition for sample ${sampleName} (ID: ${sampleID}). Existing: ${existing.unitFromTable}, Current: ${unitFromTable}`);
+            continue;
+          }
+          
+          if (existingUnitDef.quantityType !== currentUnitDef.quantityType) {
+            console.warn(`EC_ASR_BUTTON: Sample ${sampleName} (ID: ${sampleID}) has incompatible quantity types: ${existingUnitDef.quantityType} vs ${currentUnitDef.quantityType}. Skipping this entry.`);
+            continue;
+          }
+          
+          // Convert current amount to same unit as existing entry 
+          // we do this in case unit definition for amount used later in experiment section is different
+          const existingAmountInBaseUnit = existing.amountUsed * existingUnitDef.calculationFactor;
+          const currentAmountInBaseUnit = numericAmount * currentUnitDef.calculationFactor;
+          const totalInBaseUnit = existingAmountInBaseUnit + currentAmountInBaseUnit;
+          
+          // Convert back to existing unit for display consistency
+          const totalInExistingUnit = totalInBaseUnit / existingUnitDef.calculationFactor;
+          
+          // Round to avoid floating point precision issues e.g getting like 55.0500000001, 
+          // NOTE: MIGHT NEED TO CHANGE TO AVOID LOSING IMPORTANT DATA
+          existing.amountUsed = Math.round(totalInExistingUnit * 1000000) / 1000000;
+          console.log(`EC_ASR_BUTTON: Updated sample ID ${sampleID} ("${sampleName}"): ${existing.amountUsed} ${existing.unitFromTable} (added ${numericAmount} ${unitFromTable}, converted to ${currentAmountInBaseUnit / existingUnitDef.calculationFactor} ${existing.unitFromTable})`);
+        } else {
+          samples_map.set(sampleID, { 
+            sampleName, 
+            amountUsed: numericAmount, 
+            unitFromTable 
+          });
+          console.log(`EC_ASR_BUTTON: Found sample ID ${sampleID} ("${sampleName}"): ${numericAmount} ${unitFromTable}`);
+        }
+        rowsProcessed++;
+      }
       
-      // check for presence of "Item" and "Amount used" columns
-      if (headers.includes('Item') && headers.includes('Amount used')) {
-        media_table = table;
-        break; // Found the table, no need to continue
+      if (rowsProcessed > 0) {
+        tablesProcessed++;
+        console.log(`EC_ASR_BUTTON: Table ${tableIndex + 1} processed ${rowsProcessed} rows`);
       }
     }
 
-    if (!media_table) {
-      console.error("EC_ASR_BUTTON: Could not find the media table in the section HTML.");
-      eLabSDK2.UI.Toast.showToast('Could not find the media table in the section HTML.');
-      return samples_map;
-    }
-
-    const rows = media_table.querySelectorAll('tbody tr');
+    console.log(`EC_ASR_BUTTON: Processed ${tablesProcessed} tables with sample data, found ${samples_map.size} unique samples`);
     
-    // Skip the first row if it contains headers (no thead present)
-    const hasThHeader = media_table.querySelector('thead th');
-    const startIndex = hasThHeader ? 0 : 1; // Skip first row if it's headers
+    if (samples_map.size === 0) {
+      console.error("EC_ASR_BUTTON: Could not find any sample data in the section HTML.");
+      eLabSDK2.UI.Toast.showToast('Could not find any sample data in the section HTML.');
+    }
+    
+    return samples_map;
 
-    // Helper function to extract sample data from a cell using different strategies
+    // Helper function to extract sample data (existing)
     function extractSampleData(cell) {
       let sampleID = null;
       let sampleName = null;
@@ -226,17 +368,19 @@ var EC_ASR_BUTTON = {};
       return { sampleID, sampleName };
     }
 
-    // Helper function to extract value from a cell using different strategies
+    // Helper function to extract value (existing)
     function extractCellValue(cell) {
+      if (!cell) return null;
+      
       let value = null;
       
-      // Strategy 1: Nested span structure (Format 1)
+      // Strategy 1: Nested span structure
       let span = cell.querySelector('span.protVar > span');
       if (span) {
         value = span.textContent.trim();
       }
       
-      // Strategy 2: Direct span structure (Format 2)
+      // Strategy 2: Direct span structure
       if (!value || value === '') {
         span = cell.querySelector('span.protVar');
         if (span) {
@@ -252,60 +396,15 @@ var EC_ASR_BUTTON = {};
         }
       }
       
-      // Strategy 4: Direct cell text content as last resort
+      // Strategy 4: Direct cell text content
       if (!value || value === '') {
         value = cell.textContent.trim();
       }
       
       return value;
     }
-
-    for (let i = startIndex; i < rows.length; i++) {
-      const row = rows[i];
-      const cells = row.querySelectorAll('td');
-      // "Item" is in the 1st cell (index 0), 
-      // "Amount used" is in the 6th cell (index 5)
-      // "Unit" for "Amount used" is in the 7th cell (index 6)
-      if (cells.length >= 7) {
-        const item_cell = cells[0];
-        const amount_used_cell = cells[5];
-        const unit_cell = cells[6];
-
-        // Extract sample data using multiple strategies
-        const { sampleID, sampleName } = extractSampleData(item_cell);
-        
-        // Extract amount used and unit
-        let amountUsedStr = extractCellValue(amount_used_cell);
-        let unitFromTable = extractCellValue(unit_cell);
-
-        if (unitFromTable) {
-          unitFromTable = unitFromTable.toLowerCase(); // normalise to lowercase
-        }
-
-        if (amountUsedStr) {
-          amountUsedStr = clean_numeric_string(amountUsedStr);
-        }
-
-        if (sampleID && sampleName && amountUsedStr !== "" && unitFromTable && unitFromTable !== "") {
-          const numericAmount = parseFloat(amountUsedStr);
-          // only add if amount is a valid +ve number
-          if (!isNaN(numericAmount) && numericAmount > 0) {
-            samples_map.set(sampleID, { sampleName, amountUsed: numericAmount, unitFromTable });
-            console.log(`EC_ASR_BUTTON: Found sample ID ${sampleID} ("${sampleName}"): ${numericAmount} ${unitFromTable}`);
-          } else {
-            console.warn(`EC_ASR_BUTTON: Item "${sampleName}" (ID: ${sampleID}) has an invalid amount used: "${amountUsedStr}" or missing unit: "${unitFromTable}".`);
-          }
-        } else {
-          console.warn(`EC_ASR_BUTTON: Could not extract complete data from row ${i}:`, {
-            sampleID, sampleName, amountUsedStr, unitFromTable
-          });
-        }
-      }
-    }
-    return samples_map;
   }
-
-
+      
   // Automatic Sample Reduction (ASR)!
   // 1. Ask for section header of the relevant experiment section
   // 2. Using the provided section header, get the experiment section (API or via expData)
@@ -435,18 +534,22 @@ var EC_ASR_BUTTON = {};
           // i.e if in ml we do amount from table * 0.001
           const amount_to_subtract_in_base_unit = table_data.amountUsed * table_unit_def.calculationFactor;
 
+          // Round to avoid floating point precision issues e.g getting like 55.0000000001, 
+          // NOTE: MIGHT NEED TO CHANGE TO AVOID LOSING IMPORTANT DATA
+          const rounded_amount_to_subtract = Math.round(amount_to_subtract_in_base_unit * 1000000) / 1000000;
+
           // Check if we have enough quantity to subtract
-          if (sample_settings.amount < amount_to_subtract_in_base_unit) {
-            validation_errors.push(`Insufficient quantity for sample ${table_data.sampleName} (ID: ${sampleID}). Available: ${sample_settings.amount} ${sample_settings.unit}, Requested: ${amount_to_subtract_in_base_unit} ${sample_settings.unit}`);
+          if (sample_settings.amount < rounded_amount_to_subtract) {
+            validation_errors.push(`Insufficient quantity for sample ${table_data.sampleName} (ID: ${sampleID}). Available: ${sample_settings.amount} ${sample_settings.unit}, Requested: ${rounded_amount_to_subtract} ${sample_settings.unit}`);
             continue;
           }
 
           samples_for_reduction.push({
             sampleID: sampleID,
             sampleName: table_data.sampleName,
-            amountFromTable: table_data.amountUsed, // Original amount from table
+            amountFromTable: table_data.amountUsed, // Original amount from table (already rounded)
             unitFromTable: table_data.unitFromTable,   // Original unit from table
-            amountToSubtract: amount_to_subtract_in_base_unit, // Amount converted to sample's base unit
+            amountToSubtract: rounded_amount_to_subtract, // Amount converted to sample's base unit AND ROUNDED
             sampleBaseUnitName: sample_settings.unit // e.g. "Gram", "Liter" for logging/debug
           });
 

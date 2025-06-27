@@ -5,7 +5,7 @@ The sectionHeader of the section containing the table with all the used sample q
 
 ### ⚠️ Formatting Warning ⚠️
 
-This addon has only been tested for Extracellular's specific table formats, other formats are not guaranteed to work. An example table format that is known to work is shown below. This would be added once in an experiment to indiciate how much of a sample is used based on how much is needed and the volume being prepared, e.g:
+This addon has only been tested for Extracellular's specific table formats, other formats are not guaranteed to work. Some example table formats that are known to work are shown below. This would be added once in an experiment to indiciate how much of a sample is used based on how much is needed and the volume being prepared, e.g:
 
 Volume of reagent being prepared: 0.2 L
 
@@ -14,6 +14,16 @@ Volume of reagent being prepared: 0.2 L
 | Sample1 | 200       | mL   | 40         | mL   | 200         | mL   |
 | Sample2 | 800       | mL   | 160        | mL   | 800         | mL   |
 | Sample3 | 10        | mL   | 2          | mL   | 2.1         | mL   |
+
+Another example is shown below, this table can be added multiple times in a single experiment section, the amount used of each sample will be added up:
+
+| Used Sample: | Used Amount: | Unit: |
+| :---:        | :---:        | :---: |
+| Sample1      | 500          | ml    |
+| Sample2      | 20           | ul    |
+| Sample3      | 1            | g     |
+
+#### IMPORTANT NOTE - Item is interchangable with Used Sample, same with Amount Used and Used Amount (colon or no colon ':').
 
 ---
 
